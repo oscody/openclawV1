@@ -10,27 +10,7 @@ import {
   updateSessionStoreEntry,
 } from "../../config/sessions.js";
 import { logVerbose } from "../../globals.js";
-
-function applyCliSessionIdToSessionPatch(
-  params: {
-    providerUsed?: string;
-    cliSessionId?: string;
-  },
-  entry: SessionEntry,
-  patch: Partial<SessionEntry>,
-): Partial<SessionEntry> {
-  const cliProvider = params.providerUsed ?? entry.modelProvider;
-  if (params.cliSessionId && cliProvider) {
-    const nextEntry = { ...entry, ...patch };
-    setCliSessionId(nextEntry, cliProvider, params.cliSessionId);
-    return {
-      ...patch,
-      cliSessionIds: nextEntry.cliSessionIds,
-      claudeCliSessionId: nextEntry.claudeCliSessionId,
-    };
-  }
-  return patch;
-}
+import { appendAiApiCallLog } from "../../infra/ai-call-tracker.js";
 
 export async function persistSessionUsageUpdate(params: {
   storePath?: string;
@@ -50,11 +30,11 @@ export async function persistSessionUsageUpdate(params: {
   systemPromptReport?: SessionSystemPromptReport;
   cliSessionId?: string;
   logLabel?: string;
+  taskType?: string;
+  description?: string;
+  source?: string;
 }): Promise<void> {
   const { storePath, sessionKey } = params;
-  if (!storePath || !sessionKey) {
-    return;
-  }
 
   const label = params.logLabel ? `${params.logLabel} ` : "";
   const hasUsage = hasNonzeroUsage(params.usage);
@@ -66,50 +46,69 @@ export async function persistSessionUsageUpdate(params: {
 
   if (hasUsage || hasFreshContextSnapshot) {
     try {
-      await updateSessionStoreEntry({
-        storePath,
-        sessionKey,
-        update: async (entry) => {
-          const resolvedContextTokens = params.contextTokensUsed ?? entry.contextTokens;
-          // Use last-call usage for totalTokens when available. The accumulated
-          // `usage.input` sums input tokens from every API call in the run
-          // (tool-use loops, compaction retries), overstating actual context.
-          // `lastCallUsage` reflects only the final API call — the true context.
-          const usageForContext = params.lastCallUsage ?? (hasUsage ? params.usage : undefined);
-          const totalTokens = hasFreshContextSnapshot
-            ? deriveSessionTotalTokens({
-                usage: usageForContext,
-                contextTokens: resolvedContextTokens,
-                promptTokens: params.promptTokens,
-              })
-            : undefined;
-          const patch: Partial<SessionEntry> = {
-            modelProvider: params.providerUsed ?? entry.modelProvider,
-            model: params.modelUsed ?? entry.model,
-            contextTokens: resolvedContextTokens,
-            systemPromptReport: params.systemPromptReport ?? entry.systemPromptReport,
-            updatedAt: Date.now(),
-          };
-          if (hasUsage) {
-            patch.inputTokens = params.usage?.input ?? 0;
-            patch.outputTokens = params.usage?.output ?? 0;
-            patch.cacheRead = params.usage?.cacheRead ?? 0;
-            patch.cacheWrite = params.usage?.cacheWrite ?? 0;
-          }
-          // Missing a last-call snapshot (and promptTokens fallback) means
-          // context utilization is stale/unknown.
-          patch.totalTokens = totalTokens;
-          patch.totalTokensFresh = typeof totalTokens === "number";
-          return applyCliSessionIdToSessionPatch(params, entry, patch);
-        },
+      const input = params.usage?.input ?? 0;
+      const output = params.usage?.output ?? 0;
+      const total = params.usage?.total ?? input + output;
+      await appendAiApiCallLog({
+        model: params.modelUsed,
+        usage: { input, output, total },
+        taskType: params.taskType,
+        description: params.description ?? `${label.trim() || "reply"} usage update`,
+        source: params.source ?? "openclaw-session-usage",
       });
     } catch (err) {
-      logVerbose(`failed to persist ${label}usage update: ${String(err)}`);
+      logVerbose(`failed to append ai-call usage log: ${String(err)}`);
+    }
+
+    if (storePath && sessionKey) {
+      try {
+        await updateSessionStoreEntry({
+          storePath,
+          sessionKey,
+          update: async (entry) => {
+            const resolvedContextTokens = params.contextTokensUsed ?? entry.contextTokens;
+            const usageForContext = params.lastCallUsage ?? (hasUsage ? params.usage : undefined);
+            const totalTokens = hasFreshContextSnapshot
+              ? deriveSessionTotalTokens({
+                  usage: usageForContext,
+                  contextTokens: resolvedContextTokens,
+                  promptTokens: params.promptTokens,
+                })
+              : undefined;
+            const patch: Partial<SessionEntry> = {
+              modelProvider: params.providerUsed ?? entry.modelProvider,
+              model: params.modelUsed ?? entry.model,
+              contextTokens: resolvedContextTokens,
+              systemPromptReport: params.systemPromptReport ?? entry.systemPromptReport,
+              updatedAt: Date.now(),
+            };
+            if (hasUsage) {
+              patch.inputTokens = params.usage?.input ?? 0;
+              patch.outputTokens = params.usage?.output ?? 0;
+              patch.cacheRead = params.usage?.cacheRead ?? 0;
+              patch.cacheWrite = params.usage?.cacheWrite ?? 0;
+            }
+            patch.totalTokens = totalTokens;
+            patch.totalTokensFresh = typeof totalTokens === "number";
+            return applyCliSessionIdToSessionPatch(params, entry, patch);
+          },
+        });
+      } catch (err) {
+        logVerbose(`failed to persist ${label}usage update: ${String(err)}`);
+      }
+    } else {
+      logVerbose(`skipping ${label}usage session-store update: missing storePath/sessionKey`);
     }
     return;
   }
 
   if (params.modelUsed || params.contextTokensUsed) {
+    if (!storePath || !sessionKey) {
+      logVerbose(
+        `skipping ${label}model/context session-store update: missing storePath/sessionKey`,
+      );
+      return;
+    }
     try {
       await updateSessionStoreEntry({
         storePath,
@@ -122,7 +121,17 @@ export async function persistSessionUsageUpdate(params: {
             systemPromptReport: params.systemPromptReport ?? entry.systemPromptReport,
             updatedAt: Date.now(),
           };
-          return applyCliSessionIdToSessionPatch(params, entry, patch);
+          const cliProvider = params.providerUsed ?? entry.modelProvider;
+          if (params.cliSessionId && cliProvider) {
+            const nextEntry = { ...entry, ...patch };
+            setCliSessionId(nextEntry, cliProvider, params.cliSessionId);
+            return {
+              ...patch,
+              cliSessionIds: nextEntry.cliSessionIds,
+              claudeCliSessionId: nextEntry.claudeCliSessionId,
+            };
+          }
+          return patch;
         },
       });
     } catch (err) {

@@ -3,6 +3,7 @@ import { healthCommand } from "../../commands/health.js";
 import { sessionsCleanupCommand } from "../../commands/sessions-cleanup.js";
 import { sessionsCommand } from "../../commands/sessions.js";
 import { statusCommand } from "../../commands/status.js";
+import { usageReportCommand } from "../../commands/usage-report.js";
 import { setVerbose } from "../../globals.js";
 import { defaultRuntime } from "../../runtime.js";
 import { formatDocsLink } from "../../terminal/links.js";
@@ -202,5 +203,32 @@ export function registerStatusHealthSessionsCommands(program: Command) {
           defaultRuntime,
         );
       });
+    });
+
+  program
+    .command("usage-report")
+    .description("Generate AI API usage and cost report from local tracker logs")
+    .option("--days <n>", "Look back window in days", "30")
+    .option("--model <model>", "Filter by model (substring match)")
+    .option("--task-type <taskType>", "Filter by task type (substring match)")
+    .option("--weekly", "Show weekly trend buckets", false)
+    .option("--json", "Output raw filtered entries as JSON", false)
+    .action(async (opts) => {
+      const parsedDays = Number.parseInt(String(opts.days ?? "30"), 10);
+      if (!Number.isFinite(parsedDays) || parsedDays <= 0) {
+        defaultRuntime.error("--days must be a positive integer");
+        defaultRuntime.exit(1);
+        return;
+      }
+      await usageReportCommand(
+        {
+          days: parsedDays,
+          model: opts.model as string | undefined,
+          taskType: opts.taskType as string | undefined,
+          weekly: Boolean(opts.weekly),
+          json: Boolean(opts.json),
+        },
+        defaultRuntime,
+      );
     });
 }
