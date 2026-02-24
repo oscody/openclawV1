@@ -210,6 +210,9 @@ export function createFollowupRunner(params: {
           providerUsed: fallbackProvider,
           contextTokensUsed,
           logLabel: "followup",
+          taskType: "followup",
+          description: "followup reply generation",
+          source: "followup-runner",
         });
       }
 

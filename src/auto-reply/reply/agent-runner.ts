@@ -393,6 +393,9 @@ export async function runReplyAgent(params: {
       contextTokensUsed,
       systemPromptReport: runResult.meta.systemPromptReport,
       cliSessionId,
+      taskType: isHeartbeat ? "heartbeat" : "business-analysis",
+      description: isHeartbeat ? "heartbeat reply generation" : "reply generation",
+      source: "agent-runner",
     });
 
     // Drain any late tool/block deliveries before deciding there's "nothing to send".

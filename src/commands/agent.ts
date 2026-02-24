@@ -24,6 +24,7 @@ import { runEmbeddedPiAgent } from "../agents/pi-embedded.js";
 import { buildWorkspaceSkillSnapshot } from "../agents/skills.js";
 import { getSkillsSnapshotVersion } from "../agents/skills/refresh.js";
 import { resolveAgentTimeoutMs } from "../agents/timeout.js";
+import { hasNonzeroUsage } from "../agents/usage.js";
 import { ensureAgentWorkspace } from "../agents/workspace.js";
 import {
   formatThinkingLevels,
@@ -43,11 +44,13 @@ import {
   type SessionEntry,
   updateSessionStore,
 } from "../config/sessions.js";
+import { logVerbose } from "../globals.js";
 import {
   clearAgentRunContext,
   emitAgentEvent,
   registerAgentRunContext,
 } from "../infra/agent-events.js";
+import { appendAiApiCallLog } from "../infra/ai-call-tracker.js";
 import { getRemoteSkillEligibility } from "../infra/skills-remote.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
@@ -491,6 +494,27 @@ export async function agentCommand(
         });
       }
       throw err;
+    }
+
+    const usage = result.meta.agentMeta?.usage;
+    if (hasNonzeroUsage(usage)) {
+      const input = usage.input ?? 0;
+      const output = usage.output ?? 0;
+      try {
+        await appendAiApiCallLog({
+          model: result.meta.agentMeta?.model ?? fallbackModel ?? model,
+          usage: {
+            input,
+            output,
+            total: usage.total ?? input + output,
+          },
+          taskType: "agent",
+          description: "agent command run",
+          source: "agent-command",
+        });
+      } catch (err) {
+        logVerbose(`failed to append ai-call usage log: ${String(err)}`);
+      }
     }
 
     // Update token+model fields in the session store.
