@@ -50,35 +50,13 @@ const SQLITE_PATH = path.join(TRACKER_DIR, "ai-api-calls.sqlite");
 
 const DEFAULT_PRICING: PricingConfig = {
   version: 1,
-  updatedAt: "2026-02-23",
+  updatedAt: "1970-01-01",
   default: { input: 1, output: 3 },
-  models: {
-    "anthropic-opus": { input: 15, output: 75 },
-    "anthropic-sonnet": { input: 3, output: 15 },
-    "anthropic-haiku": { input: 0.8, output: 4 },
-    "openai-gpt-4": { input: 30, output: 60 },
-    "openai-gpt-4-turbo": { input: 10, output: 30 },
-    "openai-gpt-3.5-turbo": { input: 0.5, output: 1.5 },
-    "openai-o1": { input: 15, output: 60 },
-    "google-gemini-pro": { input: 10, output: 30 },
-    "google-gemini-flash": { input: 0.3, output: 1.2 },
-    "google-gemini-1.5-pro": { input: 1.25, output: 5 },
-    "xai-grok": { input: 2, output: 10 },
-  },
-  patterns: {
-    "anthropic-opus": ["opus", "claude-3-opus", "claude opus"],
-    "anthropic-sonnet": ["sonnet", "claude-3-sonnet", "claude sonnet"],
-    "anthropic-haiku": ["haiku", "claude-3-haiku", "claude haiku"],
-    "openai-gpt-4": ["gpt-4", "gpt4"],
-    "openai-gpt-4-turbo": ["gpt-4-turbo", "gpt4-turbo"],
-    "openai-gpt-3.5-turbo": ["gpt-3.5-turbo", "gpt-35-turbo", "gpt3.5"],
-    "openai-o1": ["o1"],
-    "google-gemini-pro": ["gemini pro"],
-    "google-gemini-flash": ["gemini flash"],
-    "google-gemini-1.5-pro": ["gemini 1.5 pro", "gemini-1.5-pro"],
-    "xai-grok": ["grok"],
-  },
+  models: {},
+  patterns: {},
 };
+
+const warnedUnknownModels = new Set<string>();
 
 function normalizePositiveInt(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -177,6 +155,11 @@ function resolvePricingForModel(model: string | undefined, pricing: PricingConfi
     if (patterns.some((pattern) => modelName.includes(pattern.toLowerCase()))) {
       return pricing.models[pricingKey] ?? pricing.default;
     }
+  }
+
+  if (!warnedUnknownModels.has(modelName)) {
+    warnedUnknownModels.add(modelName);
+    console.warn(`[usage-tracker] missing pricing for model: ${modelName}`);
   }
 
   return pricing.default;
