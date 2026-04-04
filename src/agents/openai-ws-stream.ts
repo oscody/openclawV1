@@ -829,7 +829,7 @@ export function createOpenAIWebSocketStreamFn(
         }) as Record<string, unknown>;
         const nextPayload = await options?.onPayload?.(payload, model);
         payload = mergeTransportMetadata(
-          (nextPayload ?? payload) as Record<string, unknown>,
+          (nextPayload ?? payload),
           turnState?.metadata,
         );
         const requestPayload = payload as Parameters<OpenAIWebSocketManager["send"]>[0];
