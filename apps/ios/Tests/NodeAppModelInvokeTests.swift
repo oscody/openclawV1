@@ -2,32 +2,8 @@ import OpenClawKit
 import Foundation
 import Testing
 import UIKit
+import UserNotifications
 @testable import OpenClaw
-
-private func withUserDefaults<T>(_ updates: [String: Any?], _ body: () throws -> T) rethrows -> T {
-    let defaults = UserDefaults.standard
-    var snapshot: [String: Any?] = [:]
-    for key in updates.keys {
-        snapshot[key] = defaults.object(forKey: key)
-    }
-    for (key, value) in updates {
-        if let value {
-            defaults.set(value, forKey: key)
-        } else {
-            defaults.removeObject(forKey: key)
-        }
-    }
-    defer {
-        for (key, value) in snapshot {
-            if let value {
-                defaults.set(value, forKey: key)
-            } else {
-                defaults.removeObject(forKey: key)
-            }
-        }
-    }
-    return try body()
-}
 
 private func makeAgentDeepLinkURL(
     message: String,
@@ -93,6 +69,28 @@ private final class MockWatchMessagingService: @preconcurrency WatchMessagingSer
     }
 }
 
+private final class MockBootstrapNotificationCenter: NotificationCentering, @unchecked Sendable {
+    var status: NotificationAuthorizationStatus = .notDetermined
+    var requestAuthorizationResult = false
+    var requestAuthorizationCalls = 0
+
+    func authorizationStatus() async -> NotificationAuthorizationStatus {
+        self.status
+    }
+
+    func requestAuthorization(options _: UNAuthorizationOptions) async throws -> Bool {
+        self.requestAuthorizationCalls += 1
+        if self.requestAuthorizationResult {
+            self.status = .authorized
+        } else {
+            self.status = .denied
+        }
+        return self.requestAuthorizationResult
+    }
+
+    func add(_: UNNotificationRequest) async throws {}
+}
+
 @Suite(.serialized) struct NodeAppModelInvokeTests {
     @Test @MainActor func decodeParamsFailsWithoutJSON() {
         #expect(throws: Error.self) {
@@ -108,17 +106,84 @@ private final class MockWatchMessagingService: @preconcurrency WatchMessagingSer
         #expect(json.contains("\"value\""))
     }
 
-    @Test @MainActor func chatSessionKeyDefaultsToIOSBase() {
+    @Test @MainActor func chatSessionKeyDefaultsToMainBase() {
         let appModel = NodeAppModel()
-        #expect(appModel.chatSessionKey == "ios")
+        #expect(appModel.chatSessionKey == "main")
     }
 
     @Test @MainActor func chatSessionKeyUsesAgentScopedKeyForNonDefaultAgent() {
         let appModel = NodeAppModel()
         appModel.gatewayDefaultAgentId = "main"
         appModel.setSelectedAgentId("agent-123")
-        #expect(appModel.chatSessionKey == SessionKey.makeAgentSessionKey(agentId: "agent-123", baseKey: "ios"))
+        #expect(appModel.chatSessionKey == SessionKey.makeAgentSessionKey(agentId: "agent-123", baseKey: "main"))
         #expect(appModel.mainSessionKey == "agent:agent-123:main")
+    }
+
+    @Test func operatorLoopWaitsForBootstrapHandoffBeforeUsingStoredToken() {
+        #expect(
+            !NodeAppModel._test_shouldStartOperatorGatewayLoop(
+                token: nil,
+                bootstrapToken: "fresh-bootstrap-token",
+                password: nil,
+                hasStoredOperatorToken: true)
+        )
+        #expect(
+            !NodeAppModel._test_shouldStartOperatorGatewayLoop(
+                token: nil,
+                bootstrapToken: nil,
+                password: nil,
+                hasStoredOperatorToken: false)
+        )
+        #expect(
+            NodeAppModel._test_shouldStartOperatorGatewayLoop(
+                token: nil,
+                bootstrapToken: nil,
+                password: nil,
+                hasStoredOperatorToken: true)
+        )
+        #expect(
+            NodeAppModel._test_shouldStartOperatorGatewayLoop(
+                token: "shared-token",
+                bootstrapToken: "fresh-bootstrap-token",
+                password: nil,
+                hasStoredOperatorToken: false)
+        )
+    }
+
+    @Test @MainActor func successfulBootstrapOnboardingRequestsNotificationAuthorization() async {
+        let center = MockBootstrapNotificationCenter()
+        let appModel = NodeAppModel(notificationCenter: center)
+
+        await appModel._test_handleSuccessfulBootstrapGatewayOnboarding()
+
+        #expect(center.requestAuthorizationCalls == 1)
+    }
+
+    @Test func clearingBootstrapTokenStripsReconnectConfigEvenWithoutPersistence() {
+        let config = GatewayConnectConfig(
+            url: URL(string: "wss://gateway.example")!,
+            stableID: "test-gateway",
+            tls: nil,
+            token: nil,
+            bootstrapToken: "spent-bootstrap-token",
+            password: nil,
+            nodeOptions: GatewayConnectOptions(
+                role: "node",
+                scopes: [],
+                caps: [],
+                commands: [],
+                permissions: [:],
+                clientId: "openclaw-ios",
+                clientMode: "node",
+                clientDisplayName: nil))
+
+        let cleared = NodeAppModel._test_clearingBootstrapToken(in: config)
+        #expect(cleared?.bootstrapToken == nil)
+        #expect(cleared?.url == config.url)
+        #expect(cleared?.stableID == config.stableID)
+        #expect(cleared?.token == config.token)
+        #expect(cleared?.password == config.password)
+        #expect(cleared?.nodeOptions.role == config.nodeOptions.role)
     }
 
     @Test @MainActor func handleInvokeRejectsBackgroundCommands() async {
@@ -202,6 +267,41 @@ private final class MockWatchMessagingService: @preconcurrency WatchMessagingSer
         let payloadData = try #require(evalRes.payloadJSON?.data(using: .utf8))
         let payload = try JSONSerialization.jsonObject(with: payloadData) as? [String: Any]
         #expect(payload?["result"] as? String == "2")
+    }
+
+    @Test @MainActor func pendingForegroundActionsReplayCanvasNavigate() async throws {
+        let appModel = NodeAppModel()
+        let navigateParams = OpenClawCanvasNavigateParams(url: "http://example.com/")
+        let navData = try JSONEncoder().encode(navigateParams)
+        let navJSON = String(decoding: navData, as: UTF8.self)
+
+        await appModel._test_applyPendingForegroundNodeActions([
+            (
+                id: "pending-nav-1",
+                command: OpenClawCanvasCommand.navigate.rawValue,
+                paramsJSON: navJSON
+            ),
+        ])
+
+        #expect(appModel.screen.urlString == "http://example.com/")
+    }
+
+    @Test @MainActor func pendingForegroundActionsDoNotApplyWhileBackgrounded() async throws {
+        let appModel = NodeAppModel()
+        appModel.setScenePhase(.background)
+        let navigateParams = OpenClawCanvasNavigateParams(url: "http://example.com/")
+        let navData = try JSONEncoder().encode(navigateParams)
+        let navJSON = String(decoding: navData, as: UTF8.self)
+
+        await appModel._test_applyPendingForegroundNodeActions([
+            (
+                id: "pending-nav-bg",
+                command: OpenClawCanvasCommand.navigate.rawValue,
+                paramsJSON: navJSON
+            ),
+        ])
+
+        #expect(appModel.screen.urlString.isEmpty)
     }
 
     @Test @MainActor func handleInvokeA2UICommandsFailWhenHostMissing() async throws {
@@ -302,6 +402,79 @@ private final class MockWatchMessagingService: @preconcurrency WatchMessagingSer
         #expect(watchService.lastSent == nil)
     }
 
+    @Test @MainActor func handleInvokeWatchNotifyAddsDefaultActionsForPrompt() async throws {
+        let watchService = MockWatchMessagingService()
+        let appModel = NodeAppModel(watchMessagingService: watchService)
+        let params = OpenClawWatchNotifyParams(
+            title: "Task",
+            body: "Action needed",
+            priority: .passive,
+            promptId: "prompt-123")
+        let paramsData = try JSONEncoder().encode(params)
+        let paramsJSON = String(decoding: paramsData, as: UTF8.self)
+        let req = BridgeInvokeRequest(
+            id: "watch-notify-default-actions",
+            command: OpenClawWatchCommand.notify.rawValue,
+            paramsJSON: paramsJSON)
+
+        let res = await appModel._test_handleInvoke(req)
+        #expect(res.ok == true)
+        #expect(watchService.lastSent?.params.risk == .low)
+        let actionIDs = watchService.lastSent?.params.actions?.map(\.id)
+        #expect(actionIDs == ["done", "snooze_10m", "open_phone", "escalate"])
+    }
+
+    @Test @MainActor func handleInvokeWatchNotifyAddsApprovalDefaults() async throws {
+        let watchService = MockWatchMessagingService()
+        let appModel = NodeAppModel(watchMessagingService: watchService)
+        let params = OpenClawWatchNotifyParams(
+            title: "Approval",
+            body: "Allow command?",
+            promptId: "prompt-approval",
+            kind: "approval")
+        let paramsData = try JSONEncoder().encode(params)
+        let paramsJSON = String(decoding: paramsData, as: UTF8.self)
+        let req = BridgeInvokeRequest(
+            id: "watch-notify-approval-defaults",
+            command: OpenClawWatchCommand.notify.rawValue,
+            paramsJSON: paramsJSON)
+
+        let res = await appModel._test_handleInvoke(req)
+        #expect(res.ok == true)
+        let actionIDs = watchService.lastSent?.params.actions?.map(\.id)
+        #expect(actionIDs == ["approve", "decline", "open_phone", "escalate"])
+        #expect(watchService.lastSent?.params.actions?[1].style == "destructive")
+    }
+
+    @Test @MainActor func handleInvokeWatchNotifyDerivesPriorityFromRiskAndCapsActions() async throws {
+        let watchService = MockWatchMessagingService()
+        let appModel = NodeAppModel(watchMessagingService: watchService)
+        let params = OpenClawWatchNotifyParams(
+            title: "Urgent",
+            body: "Check now",
+            risk: .high,
+            actions: [
+                OpenClawWatchAction(id: "a1", label: "A1"),
+                OpenClawWatchAction(id: "a2", label: "A2"),
+                OpenClawWatchAction(id: "a3", label: "A3"),
+                OpenClawWatchAction(id: "a4", label: "A4"),
+                OpenClawWatchAction(id: "a5", label: "A5"),
+            ])
+        let paramsData = try JSONEncoder().encode(params)
+        let paramsJSON = String(decoding: paramsData, as: UTF8.self)
+        let req = BridgeInvokeRequest(
+            id: "watch-notify-derive-priority",
+            command: OpenClawWatchCommand.notify.rawValue,
+            paramsJSON: paramsJSON)
+
+        let res = await appModel._test_handleInvoke(req)
+        #expect(res.ok == true)
+        #expect(watchService.lastSent?.params.priority == .timeSensitive)
+        #expect(watchService.lastSent?.params.risk == .high)
+        let actionIDs = watchService.lastSent?.params.actions?.map(\.id)
+        #expect(actionIDs == ["a1", "a2", "a3", "a4"])
+    }
+
     @Test @MainActor func handleInvokeWatchNotifyReturnsUnavailableOnDeliveryFailure() async throws {
         let watchService = MockWatchMessagingService()
         watchService.sendError = NSError(
@@ -366,6 +539,20 @@ private final class MockWatchMessagingService: @preconcurrency WatchMessagingSer
         await appModel.approvePendingAgentDeepLinkPrompt()
         #expect(appModel.pendingAgentDeepLinkPrompt == nil)
         #expect(appModel.openChatRequestID == 1)
+    }
+
+    @Test @MainActor func handleDeepLinkCoalescesPromptWhenRateLimited() async throws {
+        let appModel = NodeAppModel()
+        appModel._test_setGatewayConnected(true)
+
+        await appModel.handleDeepLink(url: makeAgentDeepLinkURL(message: "first prompt"))
+        let firstPrompt = try #require(appModel.pendingAgentDeepLinkPrompt)
+
+        await appModel.handleDeepLink(url: makeAgentDeepLinkURL(message: "second prompt"))
+        let coalescedPrompt = try #require(appModel.pendingAgentDeepLinkPrompt)
+
+        #expect(coalescedPrompt.id != firstPrompt.id)
+        #expect(coalescedPrompt.messagePreview.contains("second prompt"))
     }
 
     @Test @MainActor func handleDeepLinkStripsDeliveryFieldsWhenUnkeyed() async throws {

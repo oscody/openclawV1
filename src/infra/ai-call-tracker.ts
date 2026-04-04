@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { resolveStateDir } from "../config/paths.js";
-import { requireNodeSqlite } from "../memory/sqlite.js";
+import { requireNodeSqlite } from "./node-sqlite.js";
 
 type Pricing = {
   input: number;

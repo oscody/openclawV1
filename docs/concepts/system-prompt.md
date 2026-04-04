@@ -59,7 +59,7 @@ Bootstrap files are trimmed and appended under **Project Context** so the model 
 - `USER.md`
 - `HEARTBEAT.md`
 - `BOOTSTRAP.md` (only on brand-new workspaces)
-- `MEMORY.md` and/or `memory.md` (when present in the workspace; either or both may be injected)
+- `MEMORY.md` when present, otherwise `memory.md` as a lowercase fallback
 
 All of these files are **injected into the context window** on every turn, which
 means they consume tokens. Keep them concise — especially `MEMORY.md`, which can
@@ -73,13 +73,19 @@ compaction.
 Large files are truncated with a marker. The max per-file size is controlled by
 `agents.defaults.bootstrapMaxChars` (default: 20000). Total injected bootstrap
 content across files is capped by `agents.defaults.bootstrapTotalMaxChars`
-(default: 150000). Missing files inject a short missing-file marker.
+(default: 150000). Missing files inject a short missing-file marker. When truncation
+occurs, OpenClaw can inject a warning block in Project Context; control this with
+`agents.defaults.bootstrapPromptTruncationWarning` (`off`, `once`, `always`;
+default: `once`).
 
 Sub-agent sessions only inject `AGENTS.md` and `TOOLS.md` (other bootstrap files
 are filtered out to keep the sub-agent context small).
 
 Internal hooks can intercept this step via `agent:bootstrap` to mutate or replace
 the injected bootstrap files (for example swapping `SOUL.md` for an alternate persona).
+
+If you want to make the agent sound less generic, start with
+[SOUL.md Personality Guide](/concepts/soul).
 
 To inspect how much each injected file contributes (raw vs injected, truncation, plus tool schema overhead), use `/context list` or `/context detail`. See [Context](/concepts/context).
 
@@ -90,7 +96,8 @@ user timezone is known. To keep the prompt cache-stable, it now only includes
 the **time zone** (no dynamic clock or time format).
 
 Use `session_status` when the agent needs the current time; the status card
-includes a timestamp line.
+includes a timestamp line. The same tool can optionally set a per-session model
+override (`model=default` clears it).
 
 Configure with:
 
@@ -106,6 +113,10 @@ When eligible skills exist, OpenClaw injects a compact **available skills list**
 prompt instructs the model to use `read` to load the SKILL.md at the listed
 location (workspace, managed, or bundled). If no skills are eligible, the
 Skills section is omitted.
+
+Eligibility includes skill metadata gates, runtime environment/config checks,
+and the effective agent skill allowlist when `agents.defaults.skills` or
+`agents.list[].skills` is configured.
 
 ```
 <available_skills>
@@ -124,6 +135,6 @@ This keeps the base prompt small while still enabling targeted skill usage.
 When available, the system prompt includes a **Documentation** section that points to the
 local OpenClaw docs directory (either `docs/` in the repo workspace or the bundled npm
 package docs) and also notes the public mirror, source repo, community Discord, and
-ClawHub ([https://clawhub.com](https://clawhub.com)) for skills discovery. The prompt instructs the model to consult local docs first
+ClawHub ([https://clawhub.ai](https://clawhub.ai)) for skills discovery. The prompt instructs the model to consult local docs first
 for OpenClaw behavior, commands, configuration, or architecture, and to run
 `openclaw status` itself when possible (asking the user only when it lacks access).

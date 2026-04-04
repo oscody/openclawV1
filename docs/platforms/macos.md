@@ -21,7 +21,7 @@ capabilities to the agent as a node.
 - Exposes macOS‑only tools (Canvas, Camera, Screen Recording, `system.run`).
 - Starts the local node host service in **remote** mode (launchd), and stops it in **local** mode.
 - Optionally hosts **PeekabooBridge** for UI automation.
-- Installs the global CLI (`openclaw`) via npm/pnpm on request (bun not recommended for the Gateway runtime).
+- Installs the global CLI (`openclaw`) on request via npm, pnpm, or bun (the app prefers npm, then pnpm, then bun; Node remains the recommended Gateway runtime).
 
 ## Local vs remote mode
 
@@ -31,18 +31,20 @@ capabilities to the agent as a node.
   a local process.
   The app starts the local **node host service** so the remote Gateway can reach this Mac.
   The app does not spawn the Gateway as a child process.
+  Gateway discovery now prefers Tailscale MagicDNS names over raw tailnet IPs,
+  so the Mac app recovers more reliably when tailnet IPs change.
 
 ## Launchd control
 
-The app manages a per‑user LaunchAgent labeled `bot.molt.gateway`
-(or `bot.molt.<profile>` when using `--profile`/`OPENCLAW_PROFILE`; legacy `com.openclaw.*` still unloads).
+The app manages a per‑user LaunchAgent labeled `ai.openclaw.gateway`
+(or `ai.openclaw.<profile>` when using `--profile`/`OPENCLAW_PROFILE`; legacy `com.openclaw.*` still unloads).
 
 ```bash
-launchctl kickstart -k gui/$UID/bot.molt.gateway
-launchctl bootout gui/$UID/bot.molt.gateway
+launchctl kickstart -k gui/$UID/ai.openclaw.gateway
+launchctl bootout gui/$UID/ai.openclaw.gateway
 ```
 
-Replace the label with `bot.molt.<profile>` when running a named profile.
+Replace the label with `ai.openclaw.<profile>` when running a named profile.
 
 If the LaunchAgent isn’t installed, enable it from the app or run
 `openclaw gateway install`.
@@ -142,6 +144,25 @@ Safety:
 2. Complete the permissions checklist (TCC prompts).
 3. Ensure **Local** mode is active and the Gateway is running.
 4. Install the CLI if you want terminal access.
+
+## State dir placement (macOS)
+
+Avoid putting your OpenClaw state dir in iCloud or other cloud-synced folders.
+Sync-backed paths can add latency and occasionally cause file-lock/sync races for
+sessions and credentials.
+
+Prefer a local non-synced state path such as:
+
+```bash
+OPENCLAW_STATE_DIR=~/.openclaw
+```
+
+If `openclaw doctor` detects state under:
+
+- `~/Library/Mobile Documents/com~apple~CloudDocs/...`
+- `~/Library/CloudStorage/...`
+
+it will warn and recommend moving back to a local path.
 
 ## Build & dev workflow (native)
 

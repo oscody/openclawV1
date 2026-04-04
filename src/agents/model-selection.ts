@@ -1,187 +1,261 @@
+import { resolveThinkingDefaultForModel } from "../auto-reply/thinking.shared.js";
 import type { OpenClawConfig } from "../config/config.js";
-import { resolveAgentModelPrimaryValue, toAgentModelListLike } from "../config/model-input.js";
+import {
+  resolveAgentModelFallbackValues,
+  resolveAgentModelPrimaryValue,
+  toAgentModelListLike,
+} from "../config/model-input.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
-import { resolveAgentConfig, resolveAgentEffectiveModelPrimary } from "./agent-scope.js";
+import { sanitizeForLog } from "../terminal/ansi.js";
+import {
+  resolveAgentConfig,
+  resolveAgentEffectiveModelPrimary,
+  resolveAgentModelFallbacksOverride,
+} from "./agent-scope.js";
+import { resolveConfiguredProviderFallback } from "./configured-provider-fallback.js";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "./defaults.js";
 import type { ModelCatalogEntry } from "./model-catalog.js";
-import { normalizeGoogleModelId } from "./models-config.providers.js";
+import { splitTrailingAuthProfile } from "./model-ref-profile.js";
+import { modelKey as sharedModelKey, normalizeStaticProviderModelId } from "./model-ref-shared.js";
+import {
+  findNormalizedProviderKey,
+  findNormalizedProviderValue,
+  normalizeProviderId,
+  normalizeProviderIdForAuth,
+} from "./provider-id.js";
+import { normalizeProviderModelIdWithRuntime } from "./provider-model-normalization.runtime.js";
 
-const log = createSubsystemLogger("model-selection");
+let log: ReturnType<typeof createSubsystemLogger> | null = null;
+
+type CliBackendRuntimeModule = typeof import("../plugins/cli-backends.runtime.js");
+
+const CLI_BACKEND_RUNTIME_CANDIDATES = [
+  "../plugins/cli-backends.runtime.js",
+  "../plugins/cli-backends.runtime.ts",
+] as const;
+
+let cliBackendRuntimeModule: CliBackendRuntimeModule | undefined;
+
+function loadCliBackendRuntime(): CliBackendRuntimeModule | null {
+  if (cliBackendRuntimeModule) {
+    return cliBackendRuntimeModule;
+  }
+  for (const candidate of CLI_BACKEND_RUNTIME_CANDIDATES) {
+    try {
+      cliBackendRuntimeModule = require(candidate) as CliBackendRuntimeModule;
+      return cliBackendRuntimeModule;
+    } catch {
+      // Try source/runtime candidates in order.
+    }
+  }
+  return null;
+}
+
+function getLog(): ReturnType<typeof createSubsystemLogger> {
+  log ??= createSubsystemLogger("model-selection");
+  return log;
+}
 
 export type ModelRef = {
   provider: string;
   model: string;
 };
 
-export type ThinkLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type ThinkLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "adaptive";
 
 export type ModelAliasIndex = {
   byAlias: Map<string, { alias: string; ref: ModelRef }>;
   byKey: Map<string, string[]>;
 };
 
-const ANTHROPIC_MODEL_ALIASES: Record<string, string> = {
-  "opus-4.6": "claude-opus-4-6",
-  "opus-4.5": "claude-opus-4-5",
-  "sonnet-4.6": "claude-sonnet-4-6",
-  "sonnet-4.5": "claude-sonnet-4-5",
-};
-const OPENAI_CODEX_OAUTH_MODEL_PREFIXES = ["gpt-5.3-codex"] as const;
-
 function normalizeAliasKey(value: string): string {
   return value.trim().toLowerCase();
 }
 
 export function modelKey(provider: string, model: string) {
-  return `${provider}/${model}`;
+  return sharedModelKey(provider, model);
 }
 
-export function normalizeProviderId(provider: string): string {
-  const normalized = provider.trim().toLowerCase();
-  if (normalized === "z.ai" || normalized === "z-ai") {
-    return "zai";
+export function legacyModelKey(provider: string, model: string): string | null {
+  const providerId = provider.trim();
+  const modelId = model.trim();
+  if (!providerId || !modelId) {
+    return null;
   }
-  if (normalized === "opencode-zen") {
-    return "opencode";
-  }
-  if (normalized === "qwen") {
-    return "qwen-portal";
-  }
-  if (normalized === "kimi-code") {
-    return "kimi-coding";
-  }
-  // Backward compatibility for older provider naming.
-  if (normalized === "bytedance" || normalized === "doubao") {
-    return "volcengine";
-  }
-  return normalized;
+  const rawKey = `${providerId}/${modelId}`;
+  const canonicalKey = modelKey(providerId, modelId);
+  return rawKey === canonicalKey ? null : rawKey;
 }
 
-export function findNormalizedProviderValue<T>(
-  entries: Record<string, T> | undefined,
-  provider: string,
-): T | undefined {
-  if (!entries) {
-    return undefined;
-  }
-  const providerKey = normalizeProviderId(provider);
-  for (const [key, value] of Object.entries(entries)) {
-    if (normalizeProviderId(key) === providerKey) {
-      return value;
-    }
-  }
-  return undefined;
-}
-
-export function findNormalizedProviderKey(
-  entries: Record<string, unknown> | undefined,
-  provider: string,
-): string | undefined {
-  if (!entries) {
-    return undefined;
-  }
-  const providerKey = normalizeProviderId(provider);
-  return Object.keys(entries).find((key) => normalizeProviderId(key) === providerKey);
-}
+export {
+  findNormalizedProviderKey,
+  findNormalizedProviderValue,
+  normalizeProviderId,
+  normalizeProviderIdForAuth,
+};
 
 export function isCliProvider(provider: string, cfg?: OpenClawConfig): boolean {
   const normalized = normalizeProviderId(provider);
-  if (normalized === "claude-cli") {
-    return true;
-  }
-  if (normalized === "codex-cli") {
+  const cliBackends = loadCliBackendRuntime()?.resolveRuntimeCliBackends() ?? [];
+  if (cliBackends.some((backend) => normalizeProviderId(backend.id) === normalized)) {
     return true;
   }
   const backends = cfg?.agents?.defaults?.cliBackends ?? {};
   return Object.keys(backends).some((key) => normalizeProviderId(key) === normalized);
 }
 
-function normalizeAnthropicModelId(model: string): string {
-  const trimmed = model.trim();
-  if (!trimmed) {
-    return trimmed;
-  }
-  const lower = trimmed.toLowerCase();
-  return ANTHROPIC_MODEL_ALIASES[lower] ?? trimmed;
-}
-
 function normalizeProviderModelId(provider: string, model: string): string {
-  if (provider === "anthropic") {
-    return normalizeAnthropicModelId(model);
-  }
-  if (provider === "vercel-ai-gateway" && !model.includes("/")) {
-    // Allow Vercel-specific Claude refs without an upstream prefix.
-    const normalizedAnthropicModel = normalizeAnthropicModelId(model);
-    if (normalizedAnthropicModel.startsWith("claude-")) {
-      return `anthropic/${normalizedAnthropicModel}`;
-    }
-  }
-  if (provider === "google") {
-    return normalizeGoogleModelId(model);
-  }
-  // OpenRouter-native models (e.g. "openrouter/aurora-alpha") need the full
-  // "openrouter/<name>" as the model ID sent to the API. Models from external
-  // providers already contain a slash (e.g. "anthropic/claude-sonnet-4-5") and
-  // are passed through as-is (#12924).
-  if (provider === "openrouter" && !model.includes("/")) {
-    return `openrouter/${model}`;
-  }
-  return model;
-}
-
-function shouldUseOpenAICodexProvider(provider: string, model: string): boolean {
-  if (provider !== "openai") {
-    return false;
-  }
-  const normalized = model.trim().toLowerCase();
-  if (!normalized) {
-    return false;
-  }
-  return OPENAI_CODEX_OAUTH_MODEL_PREFIXES.some(
-    (prefix) => normalized === prefix || normalized.startsWith(`${prefix}-`),
+  const staticModelId = normalizeStaticProviderModelId(provider, model);
+  return (
+    normalizeProviderModelIdWithRuntime({
+      provider,
+      context: {
+        provider,
+        modelId: staticModelId,
+      },
+    }) ?? staticModelId
   );
 }
 
-export function normalizeModelRef(provider: string, model: string): ModelRef {
+type ModelRefNormalizeOptions = {
+  allowPluginNormalization?: boolean;
+};
+
+export function normalizeModelRef(
+  provider: string,
+  model: string,
+  options?: ModelRefNormalizeOptions,
+): ModelRef {
   const normalizedProvider = normalizeProviderId(provider);
-  const normalizedModel = normalizeProviderModelId(normalizedProvider, model.trim());
-  if (shouldUseOpenAICodexProvider(normalizedProvider, normalizedModel)) {
-    return { provider: "openai-codex", model: normalizedModel };
-  }
+  const normalizedModel =
+    options?.allowPluginNormalization === false
+      ? model.trim()
+      : normalizeProviderModelId(normalizedProvider, model.trim());
   return { provider: normalizedProvider, model: normalizedModel };
 }
 
-export function parseModelRef(raw: string, defaultProvider: string): ModelRef | null {
+type ParseModelRefOptions = ModelRefNormalizeOptions;
+
+export function parseModelRef(
+  raw: string,
+  defaultProvider: string,
+  options?: ParseModelRefOptions,
+): ModelRef | null {
   const trimmed = raw.trim();
   if (!trimmed) {
     return null;
   }
   const slash = trimmed.indexOf("/");
   if (slash === -1) {
-    return normalizeModelRef(defaultProvider, trimmed);
+    return normalizeModelRef(defaultProvider, trimmed, options);
   }
   const providerRaw = trimmed.slice(0, slash).trim();
   const model = trimmed.slice(slash + 1).trim();
   if (!providerRaw || !model) {
     return null;
   }
-  return normalizeModelRef(providerRaw, model);
+  return normalizeModelRef(providerRaw, model, options);
 }
 
-export function normalizeModelSelection(value: unknown): string | undefined {
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    return trimmed || undefined;
+export function resolvePersistedModelRef(params: {
+  defaultProvider: string;
+  runtimeProvider?: string;
+  runtimeModel?: string;
+  overrideProvider?: string;
+  overrideModel?: string;
+}): ModelRef | null {
+  const defaultProvider = params.defaultProvider.trim();
+  const runtimeProvider = params.runtimeProvider?.trim();
+  const runtimeModel = params.runtimeModel?.trim();
+  if (runtimeModel) {
+    if (runtimeProvider) {
+      return { provider: runtimeProvider, model: runtimeModel };
+    }
+    return (
+      parseModelRef(runtimeModel, defaultProvider) ?? {
+        provider: defaultProvider,
+        model: runtimeModel,
+      }
+    );
   }
-  if (!value || typeof value !== "object") {
+
+  const overrideProvider = params.overrideProvider?.trim();
+  const overrideModel = params.overrideModel?.trim();
+  if (!overrideModel) {
+    return null;
+  }
+  const encodedOverride = overrideProvider ? `${overrideProvider}/${overrideModel}` : overrideModel;
+  return (
+    parseModelRef(encodedOverride, defaultProvider) ?? {
+      provider: overrideProvider || defaultProvider,
+      model: overrideModel,
+    }
+  );
+}
+
+export function inferUniqueProviderFromConfiguredModels(params: {
+  cfg: OpenClawConfig;
+  model: string;
+}): string | undefined {
+  const model = params.model.trim();
+  if (!model) {
     return undefined;
   }
-  const primary = (value as { primary?: unknown }).primary;
-  if (typeof primary === "string") {
-    const trimmed = primary.trim();
-    return trimmed || undefined;
+  const normalized = model.toLowerCase();
+  const providers = new Set<string>();
+  const addProvider = (provider: string) => {
+    const normalizedProvider = normalizeProviderId(provider);
+    if (!normalizedProvider) {
+      return;
+    }
+    providers.add(normalizedProvider);
+  };
+  const configuredModels = params.cfg.agents?.defaults?.models;
+  if (configuredModels) {
+    for (const key of Object.keys(configuredModels)) {
+      const ref = key.trim();
+      if (!ref || !ref.includes("/")) {
+        continue;
+      }
+      const parsed = parseModelRef(ref, DEFAULT_PROVIDER, {
+        allowPluginNormalization: false,
+      });
+      if (!parsed) {
+        continue;
+      }
+      if (parsed.model === model || parsed.model.toLowerCase() === normalized) {
+        addProvider(parsed.provider);
+        if (providers.size > 1) {
+          return undefined;
+        }
+      }
+    }
   }
-  return undefined;
+  const configuredProviders = params.cfg.models?.providers;
+  if (configuredProviders) {
+    for (const [providerId, providerConfig] of Object.entries(configuredProviders)) {
+      const models = providerConfig?.models;
+      if (!Array.isArray(models)) {
+        continue;
+      }
+      for (const entry of models) {
+        const modelId = entry?.id?.trim();
+        if (!modelId) {
+          continue;
+        }
+        if (modelId === model || modelId.toLowerCase() === normalized) {
+          addProvider(providerId);
+        }
+      }
+      if (providers.size > 1) {
+        return undefined;
+      }
+    }
+  }
+  if (providers.size !== 1) {
+    return undefined;
+  }
+  return providers.values().next().value;
 }
 
 export function resolveAllowlistModelKey(raw: string, defaultProvider: string): string | null {
@@ -214,13 +288,16 @@ export function buildConfiguredAllowlistKeys(params: {
 export function buildModelAliasIndex(params: {
   cfg: OpenClawConfig;
   defaultProvider: string;
+  allowPluginNormalization?: boolean;
 }): ModelAliasIndex {
   const byAlias = new Map<string, { alias: string; ref: ModelRef }>();
   const byKey = new Map<string, string[]>();
 
   const rawModels = params.cfg.agents?.defaults?.models ?? {};
   for (const [keyRaw, entryRaw] of Object.entries(rawModels)) {
-    const parsed = parseModelRef(String(keyRaw ?? ""), params.defaultProvider);
+    const parsed = parseModelRef(String(keyRaw ?? ""), params.defaultProvider, {
+      allowPluginNormalization: params.allowPluginNormalization,
+    });
     if (!parsed) {
       continue;
     }
@@ -243,19 +320,22 @@ export function resolveModelRefFromString(params: {
   raw: string;
   defaultProvider: string;
   aliasIndex?: ModelAliasIndex;
+  allowPluginNormalization?: boolean;
 }): { ref: ModelRef; alias?: string } | null {
-  const trimmed = params.raw.trim();
-  if (!trimmed) {
+  const { model } = splitTrailingAuthProfile(params.raw);
+  if (!model) {
     return null;
   }
-  if (!trimmed.includes("/")) {
-    const aliasKey = normalizeAliasKey(trimmed);
+  if (!model.includes("/")) {
+    const aliasKey = normalizeAliasKey(model);
     const aliasMatch = params.aliasIndex?.byAlias.get(aliasKey);
     if (aliasMatch) {
       return { ref: aliasMatch.ref, alias: aliasMatch.alias };
     }
   }
-  const parsed = parseModelRef(trimmed, params.defaultProvider);
+  const parsed = parseModelRef(model, params.defaultProvider, {
+    allowPluginNormalization: params.allowPluginNormalization,
+  });
   if (!parsed) {
     return null;
   }
@@ -266,6 +346,7 @@ export function resolveConfiguredModelRef(params: {
   cfg: OpenClawConfig;
   defaultProvider: string;
   defaultModel: string;
+  allowPluginNormalization?: boolean;
 }): ModelRef {
   const rawModel = resolveAgentModelPrimaryValue(params.cfg.agents?.defaults?.model) ?? "";
   if (rawModel) {
@@ -273,6 +354,7 @@ export function resolveConfiguredModelRef(params: {
     const aliasIndex = buildModelAliasIndex({
       cfg: params.cfg,
       defaultProvider: params.defaultProvider,
+      allowPluginNormalization: params.allowPluginNormalization,
     });
     if (!trimmed.includes("/")) {
       const aliasKey = normalizeAliasKey(trimmed);
@@ -281,21 +363,50 @@ export function resolveConfiguredModelRef(params: {
         return aliasMatch.ref;
       }
 
-      // Default to anthropic if no provider is specified, but warn as this is deprecated.
-      log.warn(
-        `Model "${trimmed}" specified without provider. Falling back to "anthropic/${trimmed}". Please use "anthropic/${trimmed}" in your config.`,
+      const inferredProvider = inferUniqueProviderFromConfiguredModels({
+        cfg: params.cfg,
+        model: trimmed,
+      });
+      if (inferredProvider) {
+        return { provider: inferredProvider, model: trimmed };
+      }
+
+      // Default to the configured provider if no provider is specified, but warn as this is deprecated.
+      const safeTrimmed = sanitizeForLog(trimmed);
+      const safeResolved = sanitizeForLog(`${params.defaultProvider}/${safeTrimmed}`);
+      getLog().warn(
+        `Model "${safeTrimmed}" specified without provider. Falling back to "${safeResolved}". Please use "${safeResolved}" in your config.`,
       );
-      return { provider: "anthropic", model: trimmed };
+      return { provider: params.defaultProvider, model: trimmed };
     }
 
     const resolved = resolveModelRefFromString({
       raw: trimmed,
       defaultProvider: params.defaultProvider,
       aliasIndex,
+      allowPluginNormalization: params.allowPluginNormalization,
     });
     if (resolved) {
       return resolved.ref;
     }
+
+    // User specified a model but it could not be resolved — warn before falling back.
+    const safe = sanitizeForLog(trimmed);
+    const safeFallback = sanitizeForLog(`${params.defaultProvider}/${params.defaultModel}`);
+    getLog().warn(
+      `Model "${safe}" could not be resolved. Falling back to default "${safeFallback}".`,
+    );
+  }
+  // Before falling back to the hardcoded default, check if the default provider
+  // is actually available. If it isn't but other providers are configured, prefer
+  // the first configured provider's first model to avoid reporting a stale default
+  // from a removed provider. (See #38880)
+  const fallbackProvider = resolveConfiguredProviderFallback({
+    cfg: params.cfg,
+    defaultProvider: params.defaultProvider,
+  });
+  if (fallbackProvider) {
+    return fallbackProvider;
   }
   return { provider: params.defaultProvider, model: params.defaultModel };
 }
@@ -330,6 +441,16 @@ export function resolveDefaultModelForAgent(params: {
   });
 }
 
+function resolveAllowedFallbacks(params: { cfg: OpenClawConfig; agentId?: string }): string[] {
+  if (params.agentId) {
+    const override = resolveAgentModelFallbacksOverride(params.cfg, params.agentId);
+    if (override !== undefined) {
+      return override;
+    }
+  }
+  return resolveAgentModelFallbackValues(params.cfg.agents?.defaults?.model);
+}
+
 export function resolveSubagentConfiguredModelSelection(params: {
   cfg: OpenClawConfig;
   agentId: string;
@@ -337,8 +458,8 @@ export function resolveSubagentConfiguredModelSelection(params: {
   const agentConfig = resolveAgentConfig(params.cfg, params.agentId);
   return (
     normalizeModelSelection(agentConfig?.subagents?.model) ??
-    normalizeModelSelection(params.cfg.agents?.defaults?.subagents?.model) ??
-    normalizeModelSelection(agentConfig?.model)
+    normalizeModelSelection(agentConfig?.model) ??
+    normalizeModelSelection(params.cfg.agents?.defaults?.subagents?.model)
   );
 }
 
@@ -367,6 +488,7 @@ export function buildAllowedModelSet(params: {
   catalog: ModelCatalogEntry[];
   defaultProvider: string;
   defaultModel?: string;
+  agentId?: string;
 }): {
   allowAny: boolean;
   allowedCatalog: ModelCatalogEntry[];
@@ -397,22 +519,42 @@ export function buildAllowedModelSet(params: {
   }
 
   const allowedKeys = new Set<string>();
-  const configuredProviders = (params.cfg.models?.providers ?? {}) as Record<string, unknown>;
+  const syntheticCatalogEntries = new Map<string, ModelCatalogEntry>();
   for (const raw of rawAllowlist) {
     const parsed = parseModelRef(String(raw), params.defaultProvider);
     if (!parsed) {
       continue;
     }
     const key = modelKey(parsed.provider, parsed.model);
-    const providerKey = normalizeProviderId(parsed.provider);
-    if (isCliProvider(parsed.provider, params.cfg)) {
+    // Explicit allowlist entries are always trusted, even when bundled catalog
+    // data is stale and does not include the configured model yet.
+    allowedKeys.add(key);
+
+    if (!catalogKeys.has(key) && !syntheticCatalogEntries.has(key)) {
+      syntheticCatalogEntries.set(key, {
+        id: parsed.model,
+        name: parsed.model,
+        provider: parsed.provider,
+      });
+    }
+  }
+
+  for (const fallback of resolveAllowedFallbacks({
+    cfg: params.cfg,
+    agentId: params.agentId,
+  })) {
+    const parsed = parseModelRef(String(fallback), params.defaultProvider);
+    if (parsed) {
+      const key = modelKey(parsed.provider, parsed.model);
       allowedKeys.add(key);
-    } else if (catalogKeys.has(key)) {
-      allowedKeys.add(key);
-    } else if (configuredProviders[providerKey] != null) {
-      // Explicitly configured providers should be allowlist-able even when
-      // they don't exist in the curated model catalog.
-      allowedKeys.add(key);
+
+      if (!catalogKeys.has(key) && !syntheticCatalogEntries.has(key)) {
+        syntheticCatalogEntries.set(key, {
+          id: parsed.model,
+          name: parsed.model,
+          provider: parsed.provider,
+        });
+      }
     }
   }
 
@@ -420,9 +562,10 @@ export function buildAllowedModelSet(params: {
     allowedKeys.add(defaultKey);
   }
 
-  const allowedCatalog = params.catalog.filter((entry) =>
-    allowedKeys.has(modelKey(entry.provider, entry.id)),
-  );
+  const allowedCatalog = [
+    ...params.catalog.filter((entry) => allowedKeys.has(modelKey(entry.provider, entry.id))),
+    ...syntheticCatalogEntries.values(),
+  ];
 
   if (allowedCatalog.length === 0 && allowedKeys.size === 0) {
     if (defaultKey) {
@@ -436,6 +579,44 @@ export function buildAllowedModelSet(params: {
   }
 
   return { allowAny: false, allowedCatalog, allowedKeys };
+}
+
+export function buildConfiguredModelCatalog(params: { cfg: OpenClawConfig }): ModelCatalogEntry[] {
+  const providers = params.cfg.models?.providers;
+  if (!providers || typeof providers !== "object") {
+    return [];
+  }
+
+  const catalog: ModelCatalogEntry[] = [];
+  for (const [providerRaw, provider] of Object.entries(providers)) {
+    const providerId = normalizeProviderId(providerRaw);
+    if (!providerId || !Array.isArray(provider?.models)) {
+      continue;
+    }
+    for (const model of provider.models) {
+      const id = typeof model?.id === "string" ? model.id.trim() : "";
+      if (!id) {
+        continue;
+      }
+      const name = typeof model?.name === "string" && model.name.trim() ? model.name.trim() : id;
+      const contextWindow =
+        typeof model?.contextWindow === "number" && model.contextWindow > 0
+          ? model.contextWindow
+          : undefined;
+      const reasoning = typeof model?.reasoning === "boolean" ? model.reasoning : undefined;
+      const input = Array.isArray(model?.input) ? model.input : undefined;
+      catalog.push({
+        provider: providerId,
+        id,
+        name,
+        contextWindow,
+        reasoning,
+        input,
+      });
+    }
+  }
+
+  return catalog;
 }
 
 export type ModelRefStatus = {
@@ -487,9 +668,19 @@ export function resolveAllowedModelRef(params: {
     cfg: params.cfg,
     defaultProvider: params.defaultProvider,
   });
+
+  // When the model string has no provider prefix ("/"), try to infer the
+  // correct provider from the configured allowlist before falling back to the
+  // session's current default provider. This prevents provider prefix drift
+  // when switching models across different providers (see #48369).
+  const effectiveDefaultProvider = !trimmed.includes("/")
+    ? (inferUniqueProviderFromConfiguredModels({ cfg: params.cfg, model: trimmed }) ??
+      params.defaultProvider)
+    : params.defaultProvider;
+
   const resolved = resolveModelRefFromString({
     raw: trimmed,
-    defaultProvider: params.defaultProvider,
+    defaultProvider: effectiveDefaultProvider,
     aliasIndex,
   });
   if (!resolved) {
@@ -516,17 +707,34 @@ export function resolveThinkingDefault(params: {
   model: string;
   catalog?: ModelCatalogEntry[];
 }): ThinkLevel {
+  const _normalizedProvider = normalizeProviderId(params.provider);
+  const _modelLower = params.model.toLowerCase();
+  const configuredModels = params.cfg.agents?.defaults?.models;
+  const canonicalKey = modelKey(params.provider, params.model);
+  const legacyKey = legacyModelKey(params.provider, params.model);
+  const perModelThinking =
+    configuredModels?.[canonicalKey]?.params?.thinking ??
+    (legacyKey ? configuredModels?.[legacyKey]?.params?.thinking : undefined);
+  if (
+    perModelThinking === "off" ||
+    perModelThinking === "minimal" ||
+    perModelThinking === "low" ||
+    perModelThinking === "medium" ||
+    perModelThinking === "high" ||
+    perModelThinking === "xhigh" ||
+    perModelThinking === "adaptive"
+  ) {
+    return perModelThinking;
+  }
   const configured = params.cfg.agents?.defaults?.thinkingDefault;
   if (configured) {
     return configured;
   }
-  const candidate = params.catalog?.find(
-    (entry) => entry.provider === params.provider && entry.id === params.model,
-  );
-  if (candidate?.reasoning) {
-    return "low";
-  }
-  return "off";
+  return resolveThinkingDefaultForModel({
+    provider: params.provider,
+    model: params.model,
+    catalog: params.catalog,
+  });
 }
 
 /** Default reasoning level when session/directive do not set it: "on" if model supports reasoning, else "off". */
@@ -569,4 +777,24 @@ export function resolveHooksGmailModel(params: {
   });
 
   return resolved?.ref ?? null;
+}
+
+/**
+ * Normalize a model selection value (string or `{primary?: string}`) to a
+ * plain trimmed string.  Returns `undefined` when the input is empty/missing.
+ * Shared by sessions-spawn and cron isolated-agent model resolution.
+ */
+export function normalizeModelSelection(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed || undefined;
+  }
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const primary = (value as { primary?: unknown }).primary;
+  if (typeof primary === "string" && primary.trim()) {
+    return primary.trim();
+  }
+  return undefined;
 }

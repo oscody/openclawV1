@@ -5,9 +5,16 @@
  * Enforced at runtime when creating sandbox containers.
  */
 
-import { existsSync, realpathSync } from "node:fs";
-import { posix } from "node:path";
+import os from "node:os";
+import path from "node:path";
+import { resolveRequiredHomeDir, resolveRequiredOsHomeDir } from "../../infra/home-dir.js";
+import { splitSandboxBindSpec } from "./bind-spec.js";
 import { SANDBOX_AGENT_WORKSPACE_MOUNT } from "./constants.js";
+import {
+  normalizeSandboxHostPath,
+  resolveSandboxHostPathViaExistingAncestor,
+} from "./host-paths.js";
+import { getBlockedNetworkModeReason } from "./network-mode.js";
 
 // Targeted denylist: host paths that should never be exposed inside sandbox containers.
 // Exported for reuse in security audit collectors.
@@ -28,7 +35,17 @@ export const BLOCKED_HOST_PATHS = [
   "/run/docker.sock",
 ];
 
-const BLOCKED_NETWORK_MODES = new Set(["host"]);
+const BLOCKED_HOME_SUBPATHS = [
+  ".aws",
+  ".cargo",
+  ".config",
+  ".docker",
+  ".gnupg",
+  ".netrc",
+  ".npm",
+  ".ssh",
+] as const;
+
 const BLOCKED_SECCOMP_PROFILES = new Set(["unconfined"]);
 const BLOCKED_APPARMOR_PROFILES = new Set(["unconfined"]);
 const RESERVED_CONTAINER_TARGET_PATHS = ["/workspace", SANDBOX_AGENT_WORKSPACE_MOUNT];
@@ -37,6 +54,10 @@ export type ValidateBindMountsOptions = {
   allowedSourceRoots?: string[];
   allowSourcesOutsideAllowedRoots?: boolean;
   allowReservedContainerTargets?: boolean;
+};
+
+export type ValidateNetworkModeOptions = {
+  allowContainerNamespaceJoin?: boolean;
 };
 
 export type BlockedBindReason =
@@ -53,20 +74,11 @@ type ParsedBindSpec = {
 
 function parseBindSpec(bind: string): ParsedBindSpec {
   const trimmed = bind.trim();
-  const firstColon = trimmed.indexOf(":");
-  if (firstColon <= 0) {
+  const parsed = splitSandboxBindSpec(trimmed);
+  if (!parsed) {
     return { source: trimmed, target: "" };
   }
-  const source = trimmed.slice(0, firstColon);
-  const rest = trimmed.slice(firstColon + 1);
-  const secondColon = rest.indexOf(":");
-  if (secondColon === -1) {
-    return { source, target: rest };
-  }
-  return {
-    source,
-    target: rest.slice(0, secondColon),
-  };
+  return { source: parsed.host, target: parsed.container };
 }
 
 /**
@@ -85,8 +97,7 @@ export function parseBindTargetPath(bind: string): string {
  * Normalize a POSIX path: resolve `.`, `..`, collapse `//`, strip trailing `/`.
  */
 export function normalizeHostPath(raw: string): string {
-  const trimmed = raw.trim();
-  return posix.normalize(trimmed).replace(/\/+$/, "") || "/";
+  return normalizeSandboxHostPath(raw);
 }
 
 /**
@@ -103,14 +114,17 @@ export function getBlockedBindReason(bind: string): BlockedBindReason | null {
   }
 
   const normalized = normalizeHostPath(sourceRaw);
-  return getBlockedReasonForSourcePath(normalized);
+  return getBlockedReasonForSourcePath(normalized, getBlockedHostPaths());
 }
 
-export function getBlockedReasonForSourcePath(sourceNormalized: string): BlockedBindReason | null {
+export function getBlockedReasonForSourcePath(
+  sourceNormalized: string,
+  blockedHostPaths: string[],
+): BlockedBindReason | null {
   if (sourceNormalized === "/") {
     return { kind: "covers", blockedPath: "/" };
   }
-  for (const blocked of BLOCKED_HOST_PATHS) {
+  for (const blocked of blockedHostPaths) {
     if (sourceNormalized === blocked || sourceNormalized.startsWith(blocked + "/")) {
       return { kind: "targets", blockedPath: blocked };
     }
@@ -119,19 +133,32 @@ export function getBlockedReasonForSourcePath(sourceNormalized: string): Blocked
   return null;
 }
 
-function tryRealpathAbsolute(path: string): string {
-  if (!path.startsWith("/")) {
-    return path;
+function getBlockedHostPaths(): string[] {
+  const blocked = new Set(BLOCKED_HOST_PATHS.map(normalizeHostPath));
+  for (const home of getBlockedHomeRoots()) {
+    for (const suffix of BLOCKED_HOME_SUBPATHS) {
+      blocked.add(normalizeHostPath(path.posix.join(home, suffix)));
+    }
   }
-  if (!existsSync(path)) {
-    return path;
+  return [...blocked];
+}
+
+function getBlockedHomeRoots(): string[] {
+  const roots = new Set<string>();
+  for (const candidate of [
+    resolveRequiredHomeDir(process.env, os.homedir),
+    resolveRequiredOsHomeDir(process.env, os.homedir),
+  ]) {
+    const normalized = normalizeHostPath(candidate);
+    if (normalized !== "/") {
+      roots.add(normalized);
+    }
+    const canonical = resolveSandboxHostPathViaExistingAncestor(normalized);
+    if (canonical !== "/") {
+      roots.add(canonical);
+    }
   }
-  try {
-    // Use native when available (keeps platform semantics); normalize for prefix checks.
-    return normalizeHostPath(realpathSync.native(path));
-  } catch {
-    return path;
-  }
+  return [...roots];
 }
 
 function normalizeAllowedRoots(roots: string[] | undefined): string[] {
@@ -145,7 +172,7 @@ function normalizeAllowedRoots(roots: string[] | undefined): string[] {
   const expanded = new Set<string>();
   for (const root of normalized) {
     expanded.add(root);
-    const real = tryRealpathAbsolute(root);
+    const real = resolveSandboxHostPathViaExistingAncestor(root);
     if (real !== root) {
       expanded.add(real);
     }
@@ -197,6 +224,26 @@ function getReservedTargetReason(bind: string): BlockedBindReason | null {
   return null;
 }
 
+function enforceSourcePathPolicy(params: {
+  bind: string;
+  sourcePath: string;
+  allowedRoots: string[];
+  blockedHostPaths: string[];
+  allowSourcesOutsideAllowedRoots: boolean;
+}): void {
+  const blockedReason = getBlockedReasonForSourcePath(params.sourcePath, params.blockedHostPaths);
+  if (blockedReason) {
+    throw formatBindBlockedError({ bind: params.bind, reason: blockedReason });
+  }
+  if (params.allowSourcesOutsideAllowedRoots) {
+    return;
+  }
+  const allowedReason = getOutsideAllowedRootsReason(params.sourcePath, params.allowedRoots);
+  if (allowedReason) {
+    throw formatBindBlockedError({ bind: params.bind, reason: allowedReason });
+  }
+}
+
 function formatBindBlockedError(params: { bind: string; reason: BlockedBindReason }): Error {
   if (params.reason.kind === "non_absolute") {
     return new Error(
@@ -220,14 +267,15 @@ function formatBindBlockedError(params: { bind: string; reason: BlockedBindReaso
   const verb = params.reason.kind === "covers" ? "covers" : "targets";
   return new Error(
     `Sandbox security: bind mount "${params.bind}" ${verb} blocked path "${params.reason.blockedPath}". ` +
-      "Mounting system directories (or Docker socket paths) into sandbox containers is not allowed. " +
+      "Mounting system directories, credential paths, or Docker socket paths into sandbox containers is not allowed. " +
       "Use project-specific paths instead (e.g. /home/user/myproject).",
   );
 }
 
 /**
  * Validate bind mounts — throws if any source path is dangerous.
- * Includes a symlink/realpath pass when the source path exists.
+ * Includes a symlink/realpath pass via existing ancestors so non-existent leaf
+ * paths cannot bypass source-root and blocked-path checks.
  */
 export function validateBindMounts(
   binds: string[] | undefined,
@@ -238,6 +286,7 @@ export function validateBindMounts(
   }
 
   const allowedRoots = normalizeAllowedRoots(options?.allowedSourceRoots);
+  const blockedHostPaths = getBlockedHostPaths();
 
   for (const rawBind of binds) {
     const bind = rawBind.trim();
@@ -260,37 +309,47 @@ export function validateBindMounts(
 
     const sourceRaw = parseBindSourcePath(bind);
     const sourceNormalized = normalizeHostPath(sourceRaw);
+    enforceSourcePathPolicy({
+      bind,
+      sourcePath: sourceNormalized,
+      allowedRoots,
+      blockedHostPaths,
+      allowSourcesOutsideAllowedRoots: options?.allowSourcesOutsideAllowedRoots === true,
+    });
 
-    if (!options?.allowSourcesOutsideAllowedRoots) {
-      const allowedReason = getOutsideAllowedRootsReason(sourceNormalized, allowedRoots);
-      if (allowedReason) {
-        throw formatBindBlockedError({ bind, reason: allowedReason });
-      }
-    }
-
-    // Symlink escape hardening: resolve existing absolute paths and re-check.
-    const sourceReal = tryRealpathAbsolute(sourceNormalized);
-    if (sourceReal !== sourceNormalized) {
-      const reason = getBlockedReasonForSourcePath(sourceReal);
-      if (reason) {
-        throw formatBindBlockedError({ bind, reason });
-      }
-      if (!options?.allowSourcesOutsideAllowedRoots) {
-        const allowedReason = getOutsideAllowedRootsReason(sourceReal, allowedRoots);
-        if (allowedReason) {
-          throw formatBindBlockedError({ bind, reason: allowedReason });
-        }
-      }
-    }
+    // Symlink escape hardening: resolve through existing ancestors and re-check.
+    const sourceCanonical = resolveSandboxHostPathViaExistingAncestor(sourceNormalized);
+    enforceSourcePathPolicy({
+      bind,
+      sourcePath: sourceCanonical,
+      allowedRoots,
+      blockedHostPaths,
+      allowSourcesOutsideAllowedRoots: options?.allowSourcesOutsideAllowedRoots === true,
+    });
   }
 }
 
-export function validateNetworkMode(network: string | undefined): void {
-  if (network && BLOCKED_NETWORK_MODES.has(network.trim().toLowerCase())) {
+export function validateNetworkMode(
+  network: string | undefined,
+  options?: ValidateNetworkModeOptions,
+): void {
+  const blockedReason = getBlockedNetworkModeReason({
+    network,
+    allowContainerNamespaceJoin: options?.allowContainerNamespaceJoin,
+  });
+  if (blockedReason === "host") {
     throw new Error(
       `Sandbox security: network mode "${network}" is blocked. ` +
         'Network "host" mode bypasses container network isolation. ' +
         'Use "bridge" or "none" instead.',
+    );
+  }
+
+  if (blockedReason === "container_namespace_join") {
+    throw new Error(
+      `Sandbox security: network mode "${network}" is blocked by default. ` +
+        'Network "container:*" joins another container namespace and bypasses sandbox network isolation. ' +
+        "Use a custom bridge network, or set dangerouslyAllowContainerNamespaceJoin=true only when you fully trust this runtime.",
     );
   }
 }
@@ -321,10 +380,13 @@ export function validateSandboxSecurity(
     network?: string;
     seccompProfile?: string;
     apparmorProfile?: string;
+    dangerouslyAllowContainerNamespaceJoin?: boolean;
   } & ValidateBindMountsOptions,
 ): void {
   validateBindMounts(cfg.binds, cfg);
-  validateNetworkMode(cfg.network);
+  validateNetworkMode(cfg.network, {
+    allowContainerNamespaceJoin: cfg.dangerouslyAllowContainerNamespaceJoin === true,
+  });
   validateSeccompProfile(cfg.seccompProfile);
   validateApparmorProfile(cfg.apparmorProfile);
 }

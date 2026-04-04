@@ -1,6 +1,7 @@
+import fs from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import * as replyModule from "../auto-reply/reply.js";
 import type { OpenClawConfig } from "../config/config.js";
+import { resolveMainSessionKey } from "../config/sessions.js";
 import { runHeartbeatOnce } from "./heartbeat-runner.js";
 import {
   seedMainSessionStore,
@@ -8,9 +9,6 @@ import {
   withTempHeartbeatSandbox,
 } from "./heartbeat-runner.test-utils.js";
 import { enqueueSystemEvent, resetSystemEventsForTest } from "./system-events.js";
-
-// Avoid pulling optional runtime deps during isolated runs.
-vi.mock("jiti", () => ({ createJiti: () => () => ({}) }));
 
 beforeEach(() => {
   setupTelegramHeartbeatPluginRuntimeForTests();
@@ -28,15 +26,14 @@ describe("Ghost reminder bug (issue #13317)", () => {
       messageId: "m1",
       chatId: "155462274",
     });
-    const getReplySpy = vi
-      .spyOn(replyModule, "getReplyFromConfig")
-      .mockResolvedValue({ text: replyText });
+    const getReplySpy = vi.fn().mockResolvedValue({ text: replyText });
     return { sendTelegram, getReplySpy };
   };
 
   const createConfig = async (params: {
     tmpDir: string;
     storePath: string;
+    target?: "telegram" | "none";
   }): Promise<{ cfg: OpenClawConfig; sessionKey: string }> => {
     const cfg: OpenClawConfig = {
       agents: {
@@ -44,7 +41,7 @@ describe("Ghost reminder bug (issue #13317)", () => {
           workspace: params.tmpDir,
           heartbeat: {
             every: "5m",
-            target: "telegram",
+            target: params.target ?? "telegram",
           },
         },
       },
@@ -54,7 +51,7 @@ describe("Ghost reminder bug (issue #13317)", () => {
     const sessionKey = await seedMainSessionStore(params.storePath, cfg, {
       lastChannel: "telegram",
       lastProvider: "telegram",
-      lastTo: "155462274",
+      lastTo: "-100155462274",
     });
 
     return { cfg, sessionKey };
@@ -81,7 +78,7 @@ describe("Ghost reminder bug (issue #13317)", () => {
   ): Promise<{
     result: Awaited<ReturnType<typeof runHeartbeatOnce>>;
     sendTelegram: ReturnType<typeof vi.fn>;
-    calledCtx: { Provider?: string; Body?: string } | null;
+    calledCtx: { Provider?: string; Body?: string; ForceSenderIsOwnerFalse?: boolean } | null;
   }> => {
     return runHeartbeatCase({
       tmpPrefix,
@@ -96,23 +93,29 @@ describe("Ghost reminder bug (issue #13317)", () => {
     replyText: string;
     reason: string;
     enqueue: (sessionKey: string) => void;
+    target?: "telegram" | "none";
   }): Promise<{
     result: Awaited<ReturnType<typeof runHeartbeatOnce>>;
     sendTelegram: ReturnType<typeof vi.fn>;
-    calledCtx: { Provider?: string; Body?: string } | null;
+    calledCtx: { Provider?: string; Body?: string; ForceSenderIsOwnerFalse?: boolean } | null;
     replyCallCount: number;
   }> => {
     return withTempHeartbeatSandbox(
       async ({ tmpDir, storePath }) => {
         const { sendTelegram, getReplySpy } = createHeartbeatDeps(params.replyText);
-        const { cfg, sessionKey } = await createConfig({ tmpDir, storePath });
+        const { cfg, sessionKey } = await createConfig({
+          tmpDir,
+          storePath,
+          target: params.target,
+        });
         params.enqueue(sessionKey);
         const result = await runHeartbeatOnce({
           cfg,
           agentId: "main",
           reason: params.reason,
           deps: {
-            sendTelegram,
+            getReplyFromConfig: getReplySpy,
+            telegram: sendTelegram,
           },
         });
         const calledCtx = (getReplySpy.mock.calls[0]?.[0] ?? null) as {
@@ -191,5 +194,168 @@ describe("Ghost reminder bug (issue #13317)", () => {
     expect(calledCtx?.Body).toContain("Cron: QMD maintenance completed");
     expect(calledCtx?.Body).not.toContain("Read HEARTBEAT.md");
     expect(sendTelegram).toHaveBeenCalled();
+  });
+
+  it("uses an internal-only cron prompt when delivery target is none", async () => {
+    const { result, sendTelegram, calledCtx } = await runHeartbeatCase({
+      tmpPrefix: "openclaw-cron-internal-",
+      replyText: "Handled internally",
+      reason: "cron:reminder-job",
+      target: "none",
+      enqueue: (sessionKey) => {
+        enqueueSystemEvent("Reminder: Rotate API keys", { sessionKey });
+      },
+    });
+
+    expect(result.status).toBe("ran");
+    expect(calledCtx?.Provider).toBe("cron-event");
+    expect(calledCtx?.Body).toContain("Handle this reminder internally");
+    expect(sendTelegram).not.toHaveBeenCalled();
+  });
+
+  it("uses an internal-only exec prompt when delivery target is none", async () => {
+    const { result, sendTelegram, calledCtx } = await runHeartbeatCase({
+      tmpPrefix: "openclaw-exec-internal-",
+      replyText: "Handled internally",
+      reason: "exec-event",
+      target: "none",
+      enqueue: (sessionKey) => {
+        enqueueSystemEvent("exec finished: deploy succeeded", { sessionKey });
+      },
+    });
+
+    expect(result.status).toBe("ran");
+    expect(calledCtx?.Provider).toBe("exec-event");
+    expect(calledCtx?.ForceSenderIsOwnerFalse).toBe(true);
+    expect(calledCtx?.Body).toContain("Handle the result internally");
+    expect(sendTelegram).not.toHaveBeenCalled();
+  });
+
+  it("routes wake-triggered heartbeat replies using queued system-event delivery context", async () => {
+    await withTempHeartbeatSandbox(async ({ tmpDir, storePath, replySpy }) => {
+      const cfg: OpenClawConfig = {
+        agents: {
+          defaults: {
+            workspace: tmpDir,
+            heartbeat: {
+              every: "5m",
+              target: "last",
+            },
+          },
+        },
+        channels: { telegram: { allowFrom: ["*"] } },
+        session: { store: storePath },
+      };
+      const sessionKey = resolveMainSessionKey(cfg);
+      await fs.writeFile(
+        storePath,
+        JSON.stringify({
+          [sessionKey]: {
+            sessionId: "sid",
+            updatedAt: Date.now(),
+          },
+        }),
+      );
+
+      const sendTelegram = vi.fn().mockResolvedValue({
+        messageId: "m1",
+        chatId: "-100155462274",
+      });
+      replySpy.mockResolvedValue({ text: "Restart complete" });
+      enqueueSystemEvent("Gateway restart ok", {
+        sessionKey,
+        deliveryContext: {
+          channel: "telegram",
+          to: "-100155462274",
+          threadId: 42,
+        },
+      });
+
+      const result = await runHeartbeatOnce({
+        cfg,
+        agentId: "main",
+        reason: "wake",
+        deps: {
+          getReplyFromConfig: replySpy,
+          telegram: sendTelegram,
+        },
+      });
+
+      expect(result.status).toBe("ran");
+      expect(sendTelegram).toHaveBeenCalledTimes(1);
+      expect(sendTelegram).toHaveBeenCalledWith(
+        "-100155462274",
+        "Restart complete",
+        expect.objectContaining({ messageThreadId: 42 }),
+      );
+    });
+  });
+
+  it("does not reuse stale turn-source routing for isolated wake runs", async () => {
+    await withTempHeartbeatSandbox(async ({ tmpDir, storePath, replySpy }) => {
+      const cfg: OpenClawConfig = {
+        agents: {
+          defaults: {
+            workspace: tmpDir,
+            heartbeat: {
+              every: "5m",
+              target: "last",
+              isolatedSession: true,
+            },
+          },
+        },
+        channels: { telegram: { allowFrom: ["*"] } },
+        session: { store: storePath },
+      };
+      const sessionKey = resolveMainSessionKey(cfg);
+      await fs.writeFile(
+        storePath,
+        JSON.stringify({
+          [sessionKey]: {
+            sessionId: "sid",
+            updatedAt: Date.now(),
+            lastChannel: "telegram",
+            lastTo: "-100155462274",
+          },
+        }),
+      );
+
+      const sendTelegram = vi.fn().mockResolvedValue({
+        messageId: "m1",
+        chatId: "-100155462274",
+      });
+      replySpy.mockResolvedValue({ text: "Restart complete" });
+      enqueueSystemEvent("Gateway restart ok", {
+        sessionKey,
+        deliveryContext: {
+          channel: "telegram",
+          to: "-100999999999",
+          threadId: 42,
+        },
+      });
+
+      const result = await runHeartbeatOnce({
+        cfg,
+        agentId: "main",
+        reason: "wake",
+        deps: {
+          getReplyFromConfig: replySpy,
+          telegram: sendTelegram,
+        },
+      });
+
+      expect(result.status).toBe("ran");
+      expect(replySpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          SessionKey: `${sessionKey}:heartbeat`,
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(sendTelegram).toHaveBeenCalledTimes(1);
+      expect(sendTelegram.mock.calls[0]?.[0]).toBe("-100155462274");
+      const options = sendTelegram.mock.calls[0]?.[2] as { messageThreadId?: number } | undefined;
+      expect(options?.messageThreadId).toBeUndefined();
+    });
   });
 });

@@ -89,7 +89,27 @@ export const cronHandlers: GatewayRequestHandlers = {
     respond(true, status, undefined);
   },
   "cron.add": async ({ params, respond, context }) => {
-    const normalized = normalizeCronJobCreate(params) ?? params;
+    const sessionKey =
+      typeof (params as { sessionKey?: unknown } | null)?.sessionKey === "string"
+        ? (params as { sessionKey: string }).sessionKey
+        : undefined;
+    let normalized: unknown;
+    try {
+      normalized =
+        normalizeCronJobCreate(params, {
+          sessionContext: { sessionKey },
+        }) ?? params;
+    } catch (err) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid cron.add params: ${err instanceof Error ? err.message : String(err)}`,
+        ),
+      );
+      return;
+    }
     if (!validateCronAddParams(normalized)) {
       respond(
         false,
@@ -112,10 +132,24 @@ export const cronHandlers: GatewayRequestHandlers = {
       return;
     }
     const job = await context.cron.add(jobCreate);
+    context.logGateway.info("cron: job created", { jobId: job.id, schedule: jobCreate.schedule });
     respond(true, job, undefined);
   },
   "cron.update": async ({ params, respond, context }) => {
-    const normalizedPatch = normalizeCronJobPatch((params as { patch?: unknown } | null)?.patch);
+    let normalizedPatch: ReturnType<typeof normalizeCronJobPatch>;
+    try {
+      normalizedPatch = normalizeCronJobPatch((params as { patch?: unknown } | null)?.patch);
+    } catch (err) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid cron.update params: ${err instanceof Error ? err.message : String(err)}`,
+        ),
+      );
+      return;
+    }
     const candidate =
       normalizedPatch && typeof params === "object" && params !== null
         ? { ...params, patch: normalizedPatch }
@@ -158,6 +192,7 @@ export const cronHandlers: GatewayRequestHandlers = {
       }
     }
     const job = await context.cron.update(jobId, patch);
+    context.logGateway.info("cron: job updated", { jobId });
     respond(true, job, undefined);
   },
   "cron.remove": async ({ params, respond, context }) => {
@@ -183,6 +218,9 @@ export const cronHandlers: GatewayRequestHandlers = {
       return;
     }
     const result = await context.cron.remove(jobId);
+    if (result.removed) {
+      context.logGateway.info("cron: job removed", { jobId });
+    }
     respond(true, result, undefined);
   },
   "cron.run": async ({ params, respond, context }) => {
@@ -207,7 +245,7 @@ export const cronHandlers: GatewayRequestHandlers = {
       );
       return;
     }
-    const result = await context.cron.run(jobId, p.mode ?? "force");
+    const result = await context.cron.enqueueRun(jobId, p.mode ?? "force");
     respond(true, result, undefined);
   },
   "cron.runs": async ({ params, respond, context }) => {
