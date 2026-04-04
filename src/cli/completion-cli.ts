@@ -11,7 +11,7 @@ import {
   buildFishOptionCompletionLine,
   buildFishSubcommandCompletionLine,
 } from "./completion-fish.js";
-import { getCoreCliCommandNames, registerCoreCliByName } from "./program/command-registry.js";
+import { registerAllCoreCliCommands } from "./program/command-registry.js";
 import { getProgramContext } from "./program/program-context.js";
 import { getSubCliEntries, registerSubCliByName } from "./program/register.subclis.js";
 
@@ -258,9 +258,7 @@ export function registerCompletionCli(program: Command) {
       // Our CLI defaults to lazy registration for perf; force-register core commands here.
       const ctx = getProgramContext(program);
       if (ctx) {
-        for (const name of getCoreCliCommandNames()) {
-          await registerCoreCliByName(program, ctx, name);
-        }
+        await registerAllCoreCliCommands(program, ctx);
       }
 
       // Eagerly register all subcommands to build the full tree

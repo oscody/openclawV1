@@ -32,6 +32,7 @@ import {
   DOUBAO_CODING_BASE_URL,
   DOUBAO_CODING_MODEL_CATALOG,
 } from "./doubao-models.js";
+import { isTimeoutError } from "./failover-error.js";
 import {
   discoverHuggingfaceModels,
   HUGGINGFACE_BASE_URL,
@@ -268,6 +269,13 @@ async function discoverOllamaModels(baseUrl?: string): Promise<ModelDefinitionCo
       };
     });
   } catch (error) {
+    if (isTimeoutError(error)) {
+      log.debug("Skipped Ollama model discovery after timeout", {
+        baseUrl: resolveOllamaApiBase(baseUrl),
+        error: String(error),
+      });
+      return [];
+    }
     log.warn(`Failed to discover Ollama models: ${String(error)}`);
     return [];
   }

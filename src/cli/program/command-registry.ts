@@ -183,6 +183,11 @@ const coreEntries: CoreCliEntry[] = [
         description: "List stored conversation sessions",
         hasSubcommands: true,
       },
+      {
+        name: "usage-report",
+        description: "Generate AI API usage and cost report from local tracker logs",
+        hasSubcommands: false,
+      },
     ],
     register: async ({ program }) => {
       const mod = await import("./register.status-health-sessions.js");
@@ -270,6 +275,17 @@ export async function registerCoreCliByName(
   removeEntryCommands(program, entry);
   await entry.register({ program, ctx, argv });
   return true;
+}
+
+export async function registerAllCoreCliCommands(
+  program: Command,
+  ctx: ProgramContext,
+  argv: string[] = process.argv,
+): Promise<void> {
+  for (const entry of coreEntries) {
+    removeEntryCommands(program, entry);
+    await entry.register({ program, ctx, argv });
+  }
 }
 
 export function registerCoreCliCommands(program: Command, ctx: ProgramContext, argv: string[]) {

@@ -12,6 +12,24 @@ import {
 import { logVerbose } from "../../globals.js";
 import { appendAiApiCallLog } from "../../infra/ai-call-tracker.js";
 
+function applyCliSessionIdToSessionPatch(
+  params: { cliSessionId?: string; providerUsed?: string },
+  entry: SessionEntry,
+  patch: Partial<SessionEntry>,
+): Partial<SessionEntry> {
+  const cliProvider = params.providerUsed ?? entry.modelProvider;
+  if (params.cliSessionId && cliProvider) {
+    const nextEntry: SessionEntry = { ...entry, ...patch };
+    setCliSessionId(nextEntry, cliProvider, params.cliSessionId);
+    return {
+      ...patch,
+      cliSessionIds: nextEntry.cliSessionIds,
+      claudeCliSessionId: nextEntry.claudeCliSessionId,
+    };
+  }
+  return patch;
+}
+
 export async function persistSessionUsageUpdate(params: {
   storePath?: string;
   sessionKey?: string;
