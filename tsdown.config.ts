@@ -168,6 +168,11 @@ export default defineConfig([
     deps: {
       neverBundle: [
         "@lancedb/lancedb",
+        "openai",
+        "@anthropic-ai/sdk",
+        /^@lancedb\/lancedb(?:\/.*)?$/,
+        /^@lancedb\/lancedb-[^/]+$/,
+        /\.node$/,
         "@matrix-org/matrix-sdk-crypto-nodejs",
         "matrix-js-sdk",
         ...bundledPluginRuntimeDependencies,
