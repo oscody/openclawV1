@@ -259,9 +259,14 @@ export function lookupContextTokens(
 }
 
 if (shouldEagerWarmContextWindowCache()) {
-  // Keep startup warmth for the real CLI, but avoid import-time side effects
-  // when this module is pulled in through library/plugin-sdk surfaces.
-  void ensureContextWindowCacheLoaded();
+  // Defer to the next event-loop tick so all modules finish initializing before
+  // loadConfig runs. Without this, new imports in the usage-tracking path
+  // (ai-call-tracker -> config/paths) shift the bundle's module evaluation order
+  // such that OpenClawSchema (from config/zod-schema) is accessed before it is
+  // initialized, causing a TDZ ReferenceError on startup.
+  setImmediate(() => {
+    void ensureContextWindowCacheLoaded();
+  });
 }
 
 function resolveConfiguredModelParams(
