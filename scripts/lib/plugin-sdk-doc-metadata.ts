@@ -62,6 +62,12 @@ export const pluginSdkDocMetadata = {
   "command-auth": {
     category: "channel",
   },
+  "command-status": {
+    category: "channel",
+  },
+  "command-status-runtime": {
+    category: "runtime",
+  },
   "secret-input": {
     category: "channel",
   },
